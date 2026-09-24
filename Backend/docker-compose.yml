@@ -1,0 +1,75 @@
+services:
+  db:
+    image: pgvector/pgvector:pg17
+    container_name: wheretf-db
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: wheretf
+    ports:
+      - "5433:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d wheretf"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  backend:
+    build:
+      context: .
+      args:
+        USE_GPU: 0  # Change to 1 if you have an Nvidia GPU
+    container_name: wheretf-backend
+    ports:
+      - "8000:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      APP_TIER: lite
+      DATABASE_URL: postgresql+psycopg://postgres:postgres@db:5432/wheretf
+      REDIS_URL: redis://redis:6379/0
+      HF_HOME: /root/.cache/huggingface
+    volumes:
+      - .:/app
+      - hf_cache:/root/.cache/huggingface
+    
+    # IMPORTANT: If USE_GPU: 1, uncomment the lines below to give the container access to your GPU hardware
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: 1
+    #           capabilities: [gpu]
+  redis:
+    image: redis:7-alpine
+    container_name: wheretf-redis
+    ports:
+      - "6379:6379"
+    restart: unless-stopped
+
+  worker:
+    build:
+      context: .
+    container_name: wheretf-worker
+    command: celery -A app.worker.celery_app worker --loglevel=info
+    volumes:
+      - .:/app
+      - hf_cache:/root/.cache/huggingface
+    environment:
+      APP_TIER: lite
+      DATABASE_URL: postgresql+psycopg://postgres:postgres@db:5432/wheretf
+      REDIS_URL: redis://redis:6379/0
+      HF_HOME: /root/.cache/huggingface
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_started
+
+volumes:
+  postgres_data:
+  hf_cache:

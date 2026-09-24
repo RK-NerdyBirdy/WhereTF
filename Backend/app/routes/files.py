@@ -1,0 +1,187 @@
+import uuid
+from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy.orm import Session
+from sqlalchemy import select,or_
+from pydantic import BaseModel
+from typing import List, Optional
+from app.models.relationship import FileRelationship
+from app.database import get_db
+from app.models import File
+
+router = APIRouter(prefix="/files", tags=["files"])
+
+# --- Pydantic Schema for the PATCH request ---
+class FileUpdatePayload(BaseModel):
+    tags: Optional[List[str]] = None
+    context: Optional[str] = None
+
+# 1. THE DASHBOARD: Get all files
+@router.get("/")
+def get_all_files(db: Session = Depends(get_db)):
+    """Retrieves all indexed files and their metadata for the dashboard view."""
+    # Using db.scalars() to get a list of File objects rather than a single scalar
+    db_files = db.scalars(select(File)).all()
+    
+    return {
+        "status": "success",
+        "count": len(db_files),
+        "data": [
+            {
+                "id": str(f.id),
+                "file_path": f.file_path,
+                "mime_type": f.mime_type,
+                "tags": f.tags,
+                "context": f.context,
+                "last_modified": f.last_modified,
+                "state": f.state  # <-- Included so your dashboard knows the Celery status!
+            }
+            for f in db_files
+        ]
+    }
+
+# 2. THE METADATA MANAGER: Update tags and context
+@router.patch("/{file_id}")
+def update_file_metadata(file_id: uuid.UUID, payload: FileUpdatePayload, db: Session = Depends(get_db)):
+    """Updates the user-defined tags and context for a specific file."""
+    db_file = db.scalar(select(File).where(File.id == file_id))
+    
+    if not db_file:
+        raise HTTPException(status_code=404, detail="File not found")
+    
+    if payload.tags is not None:
+        db_file.tags = payload.tags
+    if payload.context is not None:
+        db_file.context = payload.context
+        
+    db.commit()
+    db.refresh(db_file)
+    
+    return {"status": "success", "message": "Metadata updated", "file_id": str(db_file.id)}
+
+# 3. THE ERASER: Delete a file and its vectors
+@router.delete("/{file_id}")
+def delete_file(file_id: uuid.UUID, db: Session = Depends(get_db)):
+    """Deletes a file and all its associated AI chunks automatically."""
+    db_file = db.scalar(select(File).where(File.id == file_id))
+    
+    if not db_file:
+        raise HTTPException(status_code=404, detail="File not found")
+        
+    db.delete(db_file)
+    db.commit()
+    
+    return {"status": "success", "message": f"File and vectors wiped successfully."}
+
+
+class FilePathRequest(BaseModel):
+    file_path: str
+
+
+@router.post("/delete-by-path")
+def delete_file_by_path(req: FilePathRequest, db: Session = Depends(get_db)):
+
+    db_file = db.scalar(
+        select(File).where(File.file_path == req.file_path)
+    )
+
+    if not db_file:
+        raise HTTPException(status_code=404, detail="File not found")
+
+    db.delete(db_file)
+    db.commit()
+
+    return {
+        "status": "success",
+        "message": "File deleted successfully."
+    }
+
+class FileRenameRequest(BaseModel):
+    old_path: str
+    new_path: str
+
+@router.post("/rename")
+def rename_file(req: FileRenameRequest, db: Session = Depends(get_db)):
+
+    db_file = db.scalar(
+        select(File).where(File.file_path == req.old_path)
+    )
+
+    if not db_file:
+        raise HTTPException(status_code=404, detail="File not found")
+
+    db_file.file_path = req.new_path
+
+    db.commit()
+
+    return {
+        "status": "success",
+        "message": "File renamed successfully."
+    }
+
+class FileCheckRequest(BaseModel):
+    file_path: str
+    file_hash: str
+
+@router.post("/needs-indexing")
+def needs_indexing(req: FileCheckRequest, db: Session = Depends(get_db)):
+    db_file = db.scalar(
+        select(File).where(
+            File.file_path == req.file_path
+        )
+    )
+
+    if db_file is None:
+        return {
+            "needs_indexing": True
+        }
+
+    if db_file.file_hash == req.file_hash:
+        return {
+            "needs_indexing": False
+        }
+
+    return {
+        "needs_indexing": True
+        }
+
+# 4. File relationship
+@router.get("/{file_id}/related")
+def get_related_files(file_id: uuid.UUID, db: Session = Depends(get_db)):
+    """Returns a list of files mathematically related to the requested file (Symmetric query)."""
+    
+    # Check if the file exists
+    db_file = db.scalar(select(File).where(File.id == file_id))
+    if not db_file:
+        raise HTTPException(status_code=404, detail="File not found")
+
+    # FIX 3: Fetch relationships where this file is EITHER the source or target
+    relationships = db.scalars(
+        select(FileRelationship)
+        .where(or_(
+            FileRelationship.source_file_id == file_id,
+            FileRelationship.target_file_id == file_id
+        ))
+        .order_by(FileRelationship.similarity_score.desc())
+    ).all()
+
+    related_data = []
+    for rel in relationships:
+        # Determine which ID is the "other" file in the relationship
+        other_id = rel.target_file_id if rel.source_file_id == file_id else rel.source_file_id
+        
+        # Fetch the actual file metadata for the other file
+        other_file = db.scalar(select(File).where(File.id == other_id))
+        
+        if other_file:
+            related_data.append({
+                "related_file_id": str(other_id),
+                "similarity_score": round(rel.similarity_score, 4),
+                "file_path": other_file.file_path,
+                "mime_type": other_file.mime_type
+            })
+
+    return {
+        "status": "success",
+        "file_id": str(file_id),
+        "related_files": related_data
+    }
